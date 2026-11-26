@@ -16,7 +16,6 @@ on:
         required: false
         default: '2'
   schedule:
-    # 毎週月曜日の午前3時 (UTC) に実行。必要に応じて変更してください。
     - cron: '0 3 * * 1'
 
 jobs:
@@ -37,7 +36,8 @@ jobs:
           git clone https://github.com/asofyan/wbdownloader.git
           cd wbdownloader
           pip install -r requirements.txt
-          python setup_browser.py   # ブラウザモード用の Playwright ブラウザをインストール
+          pip install playwright-stealth
+          python setup_browser.py
 
       - name: Determine snapshot timestamp
         id: get_timestamp
@@ -46,7 +46,6 @@ jobs:
           if [ -n "${{ github.event.inputs.snapshot_timestamp }}" ]; then
             echo "timestamp=${{ github.event.inputs.snapshot_timestamp }}" >> $GITHUB_OUTPUT
           else
-            # CDX API で最新スナップショットを取得（直接接続）
             LATEST_TS=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
             if [ -z "$LATEST_TS" ]; then
               echo "Error: スナップショットが見つかりませんでした。" >&2
