@@ -1,4 +1,4 @@
-name: Download Wayback Machine Archive (waybackpack)
+name: Download Wayback Machine Archive
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
         description: 'ダウンロードするURL (スキーム含む。例: http://www.nintendo.com)'
         required: true
         default: 'http://example.com'
+      max_snapshots:
+        description: 'ダウンロードするスナップショットの最大個数'
+        required: true
+        default: '10'
       from_date:
         description: '開始タイムスタンプ (YYYYMMDD形式、空欄なら最古から)'
         required: false
@@ -16,11 +20,14 @@ on:
         required: false
         default: ''
       delay_seconds:
-        description: 'リクエスト間の遅延（秒）。レート制限回避用'
+        description: 'リクエスト間の遅延（秒）'
         required: false
         default: '2'
   schedule:
     - cron: '0 3 * * 1'
+
+permissions:
+  contents: write   # Release作成・アセットアップロードに必要
 
 jobs:
   download:
@@ -38,30 +45,69 @@ jobs:
       - name: Install waybackpack
         run: pip install waybackpack
 
-      - name: Build waybackpack arguments
-        id: args
+      - name: Download limited snapshots via Python script
+        id: download
         shell: bash
         run: |
-          ARGS="${{ github.event.inputs.target_url }} -d ./downloaded-archive"
-          ARGS="$ARGS --delay ${{ github.event.inputs.delay_seconds }}"
-          ARGS="$ARGS --max-retries 3"
-          ARGS="$ARGS --ignore-errors"
+          python - <<'PYEOF'
+          import subprocess, sys, os
 
-          if [ -n "${{ github.event.inputs.from_date }}" ]; then
-            ARGS="$ARGS --from-date ${{ github.event.inputs.from_date }}"
+          url = "${{ github.event.inputs.target_url }}"
+          max_n = int("${{ github.event.inputs.max_snapshots }}")
+          from_date = "${{ github.event.inputs.from_date }}"
+          to_date = "${{ github.event.inputs.to_date }}"
+          delay = "${{ github.event.inputs.delay_seconds }}"
+
+          # --list でスナップショット一覧を取得
+          cmd_list = ["waybackpack", url, "--list"]
+          if from_date: cmd_list += ["--from-date", from_date]
+          if to_date: cmd_list += ["--to-date", to_date]
+
+          result = subprocess.run(cmd_list, capture_output=True, text=True)
+          if result.returncode != 0:
+              print("Failed to list snapshots:", result.stderr, file=sys.stderr)
+              sys.exit(1)
+
+          timestamps = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+          print(f"Found {len(timestamps)} snapshots total.")
+
+          selected = timestamps[:max_n]
+          print(f"Downloading first {len(selected)} snapshots (max_snapshots={max_n}).")
+
+          if not selected:
+              print("No snapshots to download.", file=sys.stderr)
+              sys.exit(1)
+
+          # 選択したタイムスタンプごとに waybackpack を実行
+          outdir = "downloaded-archive"
+          os.makedirs(outdir, exist_ok=True)
+
+          for ts in selected:
+              print(f"Downloading snapshot: {ts}")
+              cmd_dl = ["waybackpack", url, "-d", outdir, "--from-date", ts, "--to-date", ts, "--delay", delay, "--ignore-errors", "--max-retries", "3"]
+              subprocess.run(cmd_dl, check=False)
+
+          print(f"Done. Files saved under {outdir}/")
+          PYEOF
+
+      - name: Verify downloaded files
+        run: |
+          if [ -z "$(ls -A downloaded-archive 2>/dev/null)" ]; then
+            echo "No files were downloaded." >&2
+            exit 1
           fi
-          if [ -n "${{ github.event.inputs.to_date }}" ]; then
-            ARGS="$ARGS --to-date ${{ github.event.inputs.to_date }}"
-          fi
+          echo "Downloaded $(find downloaded-archive -type f | wc -l) files."
 
-          echo "args=$ARGS" >> $GITHUB_OUTPUT
-
-      - name: Run waybackpack
-        run: waybackpack ${{ steps.args.outputs.args }}
-
-      - name: Upload downloaded archive as artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release and upload downloaded archive
+        uses: softprops/action-gh-release@v2
         with:
-          name: wayback-archive-${{ github.run_number }}
-          path: ./downloaded-archive
-          retention-days: 7
+          tag_name: wayback-${{ github.run_id }}-${{ github.run_attempt }}
+          name: "Wayback archive: ${{ github.event.inputs.target_url }} (${{ github.run_number }})"
+          body: |
+            Target URL: ${{ github.event.inputs.target_url }}
+            Max snapshots: ${{ github.event.inputs.max_snapshots }}
+            From: ${{ github.event.inputs.from_date || '(oldest)' }}
+            To: ${{ github.event.inputs.to_date || '(latest)' }}
+          files: |
+            downloaded-archive/**/*
+          overwrite_files: true
