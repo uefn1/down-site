@@ -16,11 +16,13 @@ on:
         required: false
         default: '2'
   schedule:
+    # 毎週月曜日の午前3時 (UTC) に実行。必要に応じて変更してください。
     - cron: '0 3 * * 1'
 
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,32 +33,20 @@ jobs:
           python-version: '3.11'
 
       # ------------------------------------------------------------
-      # WARP セットアップ (プロキシモード)
+      # Cloudflare WARP セットアップ (フルトンネル)
+      # 以降の全通信が自動的に WARP 経由になる
       # ------------------------------------------------------------
-      - name: Install Cloudflare WARP
-        run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-
-      - name: Configure WARP in proxy mode
-        run: |
-          # 既存の登録があれば削除してクリーンな状態にする
-          warp-cli registration delete || true
-
-          # --accept-tos をグローバルオプションとして先頭に置く
-          warp-cli --accept-tos registration new
-
-          warp-cli mode proxy
-          warp-cli proxy port 40000
-          warp-cli connect
-          sleep 5
+      - name: Set up Cloudflare WARP
+        uses: viperadnan-git/setup-warp@v1
+        with:
+          mode: client   # 公式WARPクライアントを使用
+          stack: dual    # IPv4/IPv6 両対応
+          retries: 3     # 接続失敗時のリトライ回数
 
       - name: Verify WARP connection
         run: |
-          # プロキシ経由でWARPが有効になっているか確認 (warp=on が返ればOK)
-          curl -x http://127.0.0.1:40000 -sL https://cloudflare.com/cdn-cgi/trace | grep warp
+          # WARP が有効か確認 (warp=on が返ればOK)
+          curl -sL https://cloudflare.com/cdn-cgi/trace | grep warp
       # ------------------------------------------------------------
 
       - name: Install wbdownloader
@@ -72,7 +62,8 @@ jobs:
           if [ -n "${{ github.event.inputs.snapshot_timestamp }}" ]; then
             echo "timestamp=${{ github.event.inputs.snapshot_timestamp }}" >> $GITHUB_OUTPUT
           else
-            LATEST_TS=$(curl -s -x http://127.0.0.1:40000 "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
+            # CDX API で最新スナップショットを取得 (WARP経由)
+            LATEST_TS=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
             if [ -z "$LATEST_TS" ]; then
               echo "Error: スナップショットが見つかりませんでした。" >&2
               exit 1
@@ -80,7 +71,7 @@ jobs:
             echo "timestamp=$LATEST_TS" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run wbdownloader through WARP proxy
+      - name: Run wbdownloader (WARP tunnel is active)
         run: |
           cd wbdownloader
           python wbdownloader.py \
@@ -88,8 +79,7 @@ jobs:
             -s "${{ steps.get_timestamp.outputs.timestamp }}" \
             -o "./downloaded-archive" \
             -l "${{ github.event.inputs.crawl_depth }}" \
-            -c 5 \
-            -p http://127.0.0.1:40000
+            -c 5
 
       - name: Upload downloaded archive as artifact
         uses: actions/upload-artifact@v4
