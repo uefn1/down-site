@@ -32,9 +32,9 @@ jobs:
           python-version: '3.11'
 
       # ------------------------------------------------------------
-      # Cloudflare WARP を SOCKS5 プロキシとして起動（疑似TTYで登録）
+      # Cloudflare WARP を SOCKS5 プロキシとして起動
       # ------------------------------------------------------------
-      - name: Setup Cloudflare WARP proxy
+      - name: Setup Cloudflare WARP proxy (SOCKS5)
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
             | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -42,13 +42,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update && sudo apt-get install -y cloudflare-warp
 
-          # warp-svc サービスを確実に起動
           sudo systemctl start warp-svc || true
-
-          # 既存登録のクリーンアップ（TTY不要）
           warp-cli --accept-tos registration delete || true
-
-          # 疑似TTYを割り当てて registration new を実行（TTY要求を回避）
           script -qec "warp-cli --accept-tos registration new" /dev/null
 
           warp-cli --accept-tos mode proxy
@@ -59,6 +54,29 @@ jobs:
       - name: Verify WARP SOCKS5 proxy
         run: |
           curl --socks5 127.0.0.1:40000 -sL https://cloudflare.com/cdn-cgi/trace | grep warp
+      # ------------------------------------------------------------
+
+      # ------------------------------------------------------------
+      # Privoxy で SOCKS5 (WARP) を HTTP プロキシに変換
+      # ------------------------------------------------------------
+      - name: Setup Privoxy (SOCKS5 → HTTP proxy)
+        run: |
+          sudo apt-get install -y privoxy
+
+          # Privoxy 設定: 8118 で待ち受け、全リクエストを WARP の SOCKS5 (40000) へ転送
+          sudo tee /etc/privoxy/config > /dev/null <<'EOF'
+          listen-address  127.0.0.1:8118
+          forward-socks5  /  127.0.0.1:40000  .
+          debug           1
+          EOF
+
+          sudo systemctl restart privoxy
+          sleep 3
+
+      - name: Verify HTTP proxy (Privoxy → WARP)
+        run: |
+          # Privoxy の HTTP プロキシ経由で WARP が有効か確認
+          curl -x http://127.0.0.1:8118 -sL https://cloudflare.com/cdn-cgi/trace | grep warp
       # ------------------------------------------------------------
 
       - name: Install wbdownloader
@@ -74,7 +92,8 @@ jobs:
           if [ -n "${{ github.event.inputs.snapshot_timestamp }}" ]; then
             echo "timestamp=${{ github.event.inputs.snapshot_timestamp }}" >> $GITHUB_OUTPUT
           else
-            LATEST_TS=$(curl --socks5 127.0.0.1:40000 -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
+            # HTTP プロキシ経由で CDX API を呼び出し
+            LATEST_TS=$(curl -x http://127.0.0.1:8118 -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
             if [ -z "$LATEST_TS" ]; then
               echo "Error: スナップショットが見つかりませんでした。" >&2
               exit 1
@@ -82,7 +101,7 @@ jobs:
             echo "timestamp=$LATEST_TS" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run wbdownloader (through WARP SOCKS5 proxy)
+      - name: Run wbdownloader (through HTTP proxy → WARP)
         run: |
           cd wbdownloader
           python wbdownloader.py \
@@ -91,7 +110,7 @@ jobs:
             -o "./downloaded-archive" \
             -l "${{ github.event.inputs.crawl_depth }}" \
             -c 5 \
-            -p socks5://127.0.0.1:40000
+            -p http://127.0.0.1:8118
 
       - name: Upload downloaded archive as artifact
         uses: actions/upload-artifact@v4
