@@ -1,4 +1,4 @@
-name: Download Wayback Machine Archive via WARP
+name: Download Wayback Machine Archive
 
 on:
   workflow_dispatch:
@@ -16,6 +16,7 @@ on:
         required: false
         default: '2'
   schedule:
+    # 毎週月曜日の午前3時 (UTC) に実行。必要に応じて変更してください。
     - cron: '0 3 * * 1'
 
 jobs:
@@ -31,59 +32,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ------------------------------------------------------------
-      # Cloudflare WARP を SOCKS5 プロキシとして起動
-      # ------------------------------------------------------------
-      - name: Setup Cloudflare WARP proxy (SOCKS5)
-        run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
-            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
-
-          sudo systemctl start warp-svc || true
-          warp-cli --accept-tos registration delete || true
-          script -qec "warp-cli --accept-tos registration new" /dev/null
-
-          warp-cli --accept-tos mode proxy
-          warp-cli --accept-tos proxy port 40000
-          warp-cli --accept-tos connect
-          sleep 5
-
-      - name: Verify WARP SOCKS5 proxy
-        run: |
-          curl --socks5 127.0.0.1:40000 -sL https://cloudflare.com/cdn-cgi/trace | grep warp
-      # ------------------------------------------------------------
-
-      # ------------------------------------------------------------
-      # Privoxy で SOCKS5 (WARP) を HTTP プロキシに変換
-      # ------------------------------------------------------------
-      - name: Setup Privoxy (SOCKS5 → HTTP proxy)
-        run: |
-          sudo apt-get install -y privoxy
-
-          # Privoxy 設定: 8118 で待ち受け、全リクエストを WARP の SOCKS5 (40000) へ転送
-          sudo tee /etc/privoxy/config > /dev/null <<'EOF'
-          listen-address  127.0.0.1:8118
-          forward-socks5  /  127.0.0.1:40000  .
-          debug           1
-          EOF
-
-          sudo systemctl restart privoxy
-          sleep 3
-
-      - name: Verify HTTP proxy (Privoxy → WARP)
-        run: |
-          # Privoxy の HTTP プロキシ経由で WARP が有効か確認
-          curl -x http://127.0.0.1:8118 -sL https://cloudflare.com/cdn-cgi/trace | grep warp
-      # ------------------------------------------------------------
-
       - name: Install wbdownloader
         run: |
           git clone https://github.com/asofyan/wbdownloader.git
           cd wbdownloader
           pip install -r requirements.txt
+          python setup_browser.py   # ブラウザモード用の Playwright ブラウザをインストール
 
       - name: Determine snapshot timestamp
         id: get_timestamp
@@ -92,8 +46,8 @@ jobs:
           if [ -n "${{ github.event.inputs.snapshot_timestamp }}" ]; then
             echo "timestamp=${{ github.event.inputs.snapshot_timestamp }}" >> $GITHUB_OUTPUT
           else
-            # HTTP プロキシ経由で CDX API を呼び出し
-            LATEST_TS=$(curl -x http://127.0.0.1:8118 -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
+            # CDX API で最新スナップショットを取得（直接接続）
+            LATEST_TS=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
             if [ -z "$LATEST_TS" ]; then
               echo "Error: スナップショットが見つかりませんでした。" >&2
               exit 1
@@ -101,7 +55,7 @@ jobs:
             echo "timestamp=$LATEST_TS" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run wbdownloader (through HTTP proxy → WARP)
+      - name: Run wbdownloader (browser mode, reduced concurrency)
         run: |
           cd wbdownloader
           python wbdownloader.py \
@@ -109,8 +63,9 @@ jobs:
             -s "${{ steps.get_timestamp.outputs.timestamp }}" \
             -o "./downloaded-archive" \
             -l "${{ github.event.inputs.crawl_depth }}" \
-            -c 5 \
-            -p http://127.0.0.1:8118
+            -c 2 \
+            --sequential-assets \
+            --browser --headless
 
       - name: Upload downloaded archive as artifact
         uses: actions/upload-artifact@v4
