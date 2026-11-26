@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'ダウンロードするサイトのURL (例: example.com)'
+        description: 'ダウンロードするサイトのホスト名 (例: www.nintendo.com、スキームは不要)'
         required: true
         default: 'example.com'
       snapshot_timestamp:
@@ -33,20 +33,30 @@ jobs:
           python-version: '3.11'
 
       # ------------------------------------------------------------
-      # Cloudflare WARP セットアップ (フルトンネル)
-      # 以降の全通信が自動的に WARP 経由になる
+      # Cloudflare WARP を SOCKS5 プロキシとして起動
       # ------------------------------------------------------------
-      - name: Set up Cloudflare WARP
-        uses: viperadnan-git/setup-warp@v1
-        with:
-          mode: client   # 公式WARPクライアントを使用
-          stack: dual    # IPv4/IPv6 両対応
-          retries: 3     # 接続失敗時のリトライ回数
-
-      - name: Verify WARP connection
+      - name: Setup Cloudflare WARP proxy
         run: |
-          # WARP が有効か確認 (warp=on が返ればOK)
-          curl -sL https://cloudflare.com/cdn-cgi/trace | grep warp
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+
+          # TTYを要求する registration new の代わりに register を使用
+          # 既存登録があれば削除してクリーンな状態にする
+          warp-cli --accept-tos registration delete || true
+          warp-cli --accept-tos register
+
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos proxy port 40000
+          warp-cli --accept-tos connect
+          sleep 5
+
+      - name: Verify WARP SOCKS5 proxy
+        run: |
+          # SOCKS5プロキシ経由でWARPが有効か確認 (warp=on が返ればOK)
+          curl --socks5 127.0.0.1:40000 -sL https://cloudflare.com/cdn-cgi/trace | grep warp
       # ------------------------------------------------------------
 
       - name: Install wbdownloader
@@ -62,8 +72,8 @@ jobs:
           if [ -n "${{ github.event.inputs.snapshot_timestamp }}" ]; then
             echo "timestamp=${{ github.event.inputs.snapshot_timestamp }}" >> $GITHUB_OUTPUT
           else
-            # CDX API で最新スナップショットを取得 (WARP経由)
-            LATEST_TS=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
+            # CDX API で最新スナップショットを取得 (WARP SOCKS5 経由)
+            LATEST_TS=$(curl --socks5 127.0.0.1:40000 -s "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.target_url }}&output=json&limit=1&filter=statuscode:200&collapse=digest" | python -c "import sys,json; data=json.load(sys.stdin); print(data[1][1] if len(data) > 1 else '')")
             if [ -z "$LATEST_TS" ]; then
               echo "Error: スナップショットが見つかりませんでした。" >&2
               exit 1
@@ -71,15 +81,16 @@ jobs:
             echo "timestamp=$LATEST_TS" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run wbdownloader (WARP tunnel is active)
+      - name: Run wbdownloader (through WARP SOCKS5 proxy)
         run: |
           cd wbdownloader
           python wbdownloader.py \
-            -f "http://${{ github.event.inputs.target_url }}" \
+            -f "${{ github.event.inputs.target_url }}" \
             -s "${{ steps.get_timestamp.outputs.timestamp }}" \
             -o "./downloaded-archive" \
             -l "${{ github.event.inputs.crawl_depth }}" \
-            -c 5
+            -c 5 \
+            -p socks5://127.0.0.1:40000
 
       - name: Upload downloaded archive as artifact
         uses: actions/upload-artifact@v4
