@@ -45,7 +45,7 @@ jobs:
       - name: Install waybackpack
         run: pip install waybackpack
 
-      - name: Download limited snapshots (rename with timestamp)
+      - name: Download limited snapshots (skip empty files)
         id: download
         shell: bash
         run: |
@@ -58,7 +58,6 @@ jobs:
           to_date = "${{ github.event.inputs.to_date }}"
           delay = "${{ github.event.inputs.delay_seconds }}"
 
-          # ① --list でスナップショット一覧を取得し、14桁のタイムスタンプを抽出
           cmd_list = ["waybackpack", url, "--list"]
           if from_date: cmd_list += ["--from-date", from_date]
           if to_date: cmd_list += ["--to-date", to_date]
@@ -82,9 +81,10 @@ jobs:
           selected = timestamps[:max_n]
           print(f"Downloading first {len(selected)} snapshots (max_snapshots={max_n}).")
 
-          # ② 各スナップショットを一時ディレクトリにDL → タイムスタンプ接頭辞でフラット化
           outdir = "downloaded-archive"
           os.makedirs(outdir, exist_ok=True)
+
+          skipped_empty = 0
 
           for ts in selected:
               tmpdir = f"/tmp/snapshots/{ts}"
@@ -100,7 +100,6 @@ jobs:
               ]
               subprocess.run(cmd_dl, check=False)
 
-              # スナップショット配下のファイルを収集
               files_found = []
               for root, dirs, files in os.walk(tmpdir):
                   for fname in files:
@@ -110,15 +109,19 @@ jobs:
                   print(f"  [warn] No files for {ts}")
                   continue
 
-              # メインの index.html を特定（最も浅い階層の index.html）
               main_index = None
               for fpath in sorted(files_found, key=lambda p: len(os.path.relpath(p, tmpdir))):
                   if os.path.basename(fpath) == "index.html":
                       main_index = fpath
                       break
 
-              # コピー＆リネーム
               for fpath in files_found:
+                  # 0バイトの空ファイルはスキップ（Releaseアップロードエラーの原因）
+                  if os.path.getsize(fpath) == 0:
+                      print(f"  [skip empty] {os.path.basename(fpath)}")
+                      skipped_empty += 1
+                      continue
+
                   rel = os.path.relpath(fpath, tmpdir)
                   if fpath == main_index:
                       dst_name = f"{ts}.html"
@@ -129,16 +132,24 @@ jobs:
                   shutil.copy2(fpath, dst)
                   print(f"  -> {dst_name}")
 
-          print(f"Done. Files saved under {outdir}/")
+          print(f"Done. Files saved under {outdir}/ (skipped {skipped_empty} empty files)")
           PYEOF
 
-      - name: Verify downloaded files
+      - name: Verify downloaded files (ensure no empty files remain)
         run: |
           if [ -z "$(ls -A downloaded-archive 2>/dev/null)" ]; then
             echo "No files were downloaded." >&2
             exit 1
           fi
-          echo "Downloaded $(find downloaded-archive -type f | wc -l) files."
+
+          # 念のため0バイトファイルが残っていないか最終確認
+          EMPTY_COUNT=$(find downloaded-archive -type f -size 0 | wc -l)
+          if [ "$EMPTY_COUNT" -gt 0 ]; then
+            echo "Removing $EMPTY_COUNT empty files that remained."
+            find downloaded-archive -type f -size 0 -delete
+          fi
+
+          echo "Downloaded $(find downloaded-archive -type f | wc -l) non-empty files."
           ls -la downloaded-archive | head -20
 
       - name: Create Release and upload downloaded archive
