@@ -42,113 +42,128 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install waybackpack
-        run: pip install waybackpack
+      - name: Install requests
+        run: pip install requests
 
-      - name: Download limited snapshots (skip empty files)
+      - name: Download snapshots via CDX API + id_ endpoint
         id: download
         shell: bash
         run: |
           python - <<'PYEOF'
-          import subprocess, sys, os, re, shutil
+          import requests, json, time, os, sys
+          from urllib.parse import urlparse
 
           url = "${{ github.event.inputs.target_url }}"
           max_n = int("${{ github.event.inputs.max_snapshots }}")
+          delay = float("${{ github.event.inputs.delay_seconds }}")
           from_date = "${{ github.event.inputs.from_date }}"
           to_date = "${{ github.event.inputs.to_date }}"
-          delay = "${{ github.event.inputs.delay_seconds }}"
 
-          cmd_list = ["waybackpack", url, "--list"]
-          if from_date: cmd_list += ["--from-date", from_date]
-          if to_date: cmd_list += ["--to-date", to_date]
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+              'Connection': 'keep-alive',
+          }
 
-          result = subprocess.run(cmd_list, capture_output=True, text=True)
-          if result.returncode != 0:
-              print("Failed to list snapshots:", result.stderr, file=sys.stderr)
+          session = requests.Session()
+          session.headers.update(headers)
+
+          # ① CDX API でスナップショット一覧を取得（最新の statuscode:200 のみ）
+          cdx_params = {
+              'url': url,
+              'output': 'json',
+              'limit': max_n,
+              'filter': 'statuscode:200',
+              'collapse': 'digest',
+          }
+          if from_date: cdx_params['from'] = from_date
+          if to_date: cdx_params['to'] = to_date
+
+          print("Querying CDX API...")
+          r = session.get('https://web.archive.org/cdx/search/cdx', params=cdx_params, timeout=60)
+          if r.status_code != 200:
+              print(f"CDX API error: HTTP {r.status_code}", file=sys.stderr)
               sys.exit(1)
 
-          timestamps = []
-          for line in result.stdout.splitlines():
-              m = re.search(r'/web/(\d{14})/', line.strip())
-              if m:
-                  timestamps.append(m.group(1))
-
-          print(f"Found {len(timestamps)} valid snapshots.")
-          if not timestamps:
-              print("No valid timestamps found.", file=sys.stderr)
+          try:
+              data = r.json()
+          except Exception as e:
+              print(f"CDX JSON parse error: {e}", file=sys.stderr)
               sys.exit(1)
 
-          selected = timestamps[:max_n]
-          print(f"Downloading first {len(selected)} snapshots (max_snapshots={max_n}).")
+          if len(data) < 2:
+              print("No snapshots found.", file=sys.stderr)
+              sys.exit(1)
+
+          rows = data[1:]
+          print(f"Found {len(rows)} snapshots (max={max_n}).")
 
           outdir = "downloaded-archive"
           os.makedirs(outdir, exist_ok=True)
 
-          skipped_empty = 0
+          success = 0
+          skipped = 0
 
-          for ts in selected:
-              tmpdir = f"/tmp/snapshots/{ts}"
-              os.makedirs(tmpdir, exist_ok=True)
+          for row in rows:
+              ts = row[1]
+              orig = row[2]
+              raw_url = f"https://web.archive.org/web/{ts}id_/{orig}"
 
-              print(f"Downloading snapshot: {ts}")
-              cmd_dl = [
-                  "waybackpack", url,
-                  "-d", tmpdir,
-                  "--from-date", ts, "--to-date", ts,
-                  "--delay", delay,
-                  "--ignore-errors", "--max-retries", "3"
-              ]
-              subprocess.run(cmd_dl, check=False)
+              path = urlparse(orig).path
+              ext = os.path.splitext(path)[1] or '.html'
+              if len(ext) > 5 or ext not in ('.html', '.htm', '.xml', '.txt', '.css', '.js', '.json'):
+                  ext = '.html'
+              filename = f"{ts}{ext}"
+              dst = os.path.join(outdir, filename)
 
-              files_found = []
-              for root, dirs, files in os.walk(tmpdir):
-                  for fname in files:
-                      files_found.append(os.path.join(root, fname))
+              done = False
+              for attempt in range(3):
+                  try:
+                      resp = session.get(raw_url, timeout=60, allow_redirects=True)
+                      if resp.status_code == 200 and len(resp.content) > 0:
+                          with open(dst, 'wb') as f:
+                              f.write(resp.content)
+                          print(f"  ✓ {filename} ({len(resp.content)} bytes)")
+                          success += 1
+                          done = True
+                          break
+                      elif resp.status_code == 429:
+                          wait = 10 * (attempt + 1)
+                          print(f"  ⏳ {ts}: 429, waiting {wait}s...")
+                          time.sleep(wait)
+                      elif resp.status_code == 404:
+                          print(f"  ✗ {ts}: 404 Not Found (skip)")
+                          done = True
+                          break
+                      else:
+                          print(f"  ✗ {ts}: HTTP {resp.status_code} (skip)")
+                          done = True
+                          break
+                  except Exception as e:
+                      print(f"  ✗ {ts}: {e} (attempt {attempt+1})")
+                      time.sleep(5)
 
-              if not files_found:
-                  print(f"  [warn] No files for {ts}")
-                  continue
+              if not done:
+                  print(f"  ⚠️ {ts}: gave up after retries")
+                  skipped += 1
 
-              main_index = None
-              for fpath in sorted(files_found, key=lambda p: len(os.path.relpath(p, tmpdir))):
-                  if os.path.basename(fpath) == "index.html":
-                      main_index = fpath
-                      break
+              time.sleep(delay)
 
-              for fpath in files_found:
-                  # 0バイトの空ファイルはスキップ（Releaseアップロードエラーの原因）
-                  if os.path.getsize(fpath) == 0:
-                      print(f"  [skip empty] {os.path.basename(fpath)}")
-                      skipped_empty += 1
-                      continue
-
-                  rel = os.path.relpath(fpath, tmpdir)
-                  if fpath == main_index:
-                      dst_name = f"{ts}.html"
-                  else:
-                      flat = rel.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
-                      dst_name = f"{ts}_{flat}"
-                  dst = os.path.join(outdir, dst_name)
-                  shutil.copy2(fpath, dst)
-                  print(f"  -> {dst_name}")
-
-          print(f"Done. Files saved under {outdir}/ (skipped {skipped_empty} empty files)")
+          print(f"Done. Success: {success}, Skipped: {skipped}")
           PYEOF
 
-      - name: Verify downloaded files (ensure no empty files remain)
+      - name: Verify downloaded files
         run: |
           if [ -z "$(ls -A downloaded-archive 2>/dev/null)" ]; then
             echo "No files were downloaded." >&2
             exit 1
           fi
-
-          # 念のため0バイトファイルが残っていないか最終確認
           EMPTY_COUNT=$(find downloaded-archive -type f -size 0 | wc -l)
           if [ "$EMPTY_COUNT" -gt 0 ]; then
-            echo "Removing $EMPTY_COUNT empty files that remained."
             find downloaded-archive -type f -size 0 -delete
+            echo "Removed $EMPTY_COUNT empty files."
           fi
-
           echo "Downloaded $(find downloaded-archive -type f | wc -l) non-empty files."
           ls -la downloaded-archive | head -20
 
