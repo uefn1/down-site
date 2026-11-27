@@ -45,12 +45,12 @@ jobs:
       - name: Install waybackpack
         run: pip install waybackpack
 
-      - name: Download limited snapshots (extract timestamps from --list)
+      - name: Download limited snapshots (rename with timestamp)
         id: download
         shell: bash
         run: |
           python - <<'PYEOF'
-          import subprocess, sys, os, re
+          import subprocess, sys, os, re, shutil
 
           url = "${{ github.event.inputs.target_url }}"
           max_n = int("${{ github.event.inputs.max_snapshots }}")
@@ -58,7 +58,7 @@ jobs:
           to_date = "${{ github.event.inputs.to_date }}"
           delay = "${{ github.event.inputs.delay_seconds }}"
 
-          # ① --list でスナップショット一覧を取得（出力はURL形式）
+          # ① --list でスナップショット一覧を取得し、14桁のタイムスタンプを抽出
           cmd_list = ["waybackpack", url, "--list"]
           if from_date: cmd_list += ["--from-date", from_date]
           if to_date: cmd_list += ["--to-date", to_date]
@@ -68,38 +68,66 @@ jobs:
               print("Failed to list snapshots:", result.stderr, file=sys.stderr)
               sys.exit(1)
 
-          # ② 各行から14桁のタイムスタンプだけを抽出（URLから分離）
           timestamps = []
           for line in result.stdout.splitlines():
-              line = line.strip()
-              if not line: continue
-              # URL中の /web/<timestamp>/ 部分を抽出
-              m = re.search(r'/web/(\d{14})/', line)
+              m = re.search(r'/web/(\d{14})/', line.strip())
               if m:
                   timestamps.append(m.group(1))
 
-          print(f"Found {len(timestamps)} valid snapshots (after timestamp extraction).")
+          print(f"Found {len(timestamps)} valid snapshots.")
           if not timestamps:
-              print("No valid timestamps found. Check the URL or date filters.", file=sys.stderr)
+              print("No valid timestamps found.", file=sys.stderr)
               sys.exit(1)
 
           selected = timestamps[:max_n]
           print(f"Downloading first {len(selected)} snapshots (max_snapshots={max_n}).")
 
-          # ③ 抽出したタイムスタンプを日付範囲に指定してダウンロード
+          # ② 各スナップショットを一時ディレクトリにDL → タイムスタンプ接頭辞でフラット化
           outdir = "downloaded-archive"
           os.makedirs(outdir, exist_ok=True)
 
           for ts in selected:
+              tmpdir = f"/tmp/snapshots/{ts}"
+              os.makedirs(tmpdir, exist_ok=True)
+
               print(f"Downloading snapshot: {ts}")
               cmd_dl = [
                   "waybackpack", url,
-                  "-d", outdir,
+                  "-d", tmpdir,
                   "--from-date", ts, "--to-date", ts,
                   "--delay", delay,
                   "--ignore-errors", "--max-retries", "3"
               ]
               subprocess.run(cmd_dl, check=False)
+
+              # スナップショット配下のファイルを収集
+              files_found = []
+              for root, dirs, files in os.walk(tmpdir):
+                  for fname in files:
+                      files_found.append(os.path.join(root, fname))
+
+              if not files_found:
+                  print(f"  [warn] No files for {ts}")
+                  continue
+
+              # メインの index.html を特定（最も浅い階層の index.html）
+              main_index = None
+              for fpath in sorted(files_found, key=lambda p: len(os.path.relpath(p, tmpdir))):
+                  if os.path.basename(fpath) == "index.html":
+                      main_index = fpath
+                      break
+
+              # コピー＆リネーム
+              for fpath in files_found:
+                  rel = os.path.relpath(fpath, tmpdir)
+                  if fpath == main_index:
+                      dst_name = f"{ts}.html"
+                  else:
+                      flat = rel.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
+                      dst_name = f"{ts}_{flat}"
+                  dst = os.path.join(outdir, dst_name)
+                  shutil.copy2(fpath, dst)
+                  print(f"  -> {dst_name}")
 
           print(f"Done. Files saved under {outdir}/")
           PYEOF
@@ -111,6 +139,7 @@ jobs:
             exit 1
           fi
           echo "Downloaded $(find downloaded-archive -type f | wc -l) files."
+          ls -la downloaded-archive | head -20
 
       - name: Create Release and upload downloaded archive
         uses: softprops/action-gh-release@v2
