@@ -27,7 +27,7 @@ on:
     - cron: '0 3 * * 1'
 
 permissions:
-  contents: write   # Release作成・アセットアップロードに必要
+  contents: write
 
 jobs:
   download:
@@ -45,12 +45,12 @@ jobs:
       - name: Install waybackpack
         run: pip install waybackpack
 
-      - name: Download limited snapshots via Python script
+      - name: Download limited snapshots (extract timestamps from --list)
         id: download
         shell: bash
         run: |
           python - <<'PYEOF'
-          import subprocess, sys, os
+          import subprocess, sys, os, re
 
           url = "${{ github.event.inputs.target_url }}"
           max_n = int("${{ github.event.inputs.max_snapshots }}")
@@ -58,7 +58,7 @@ jobs:
           to_date = "${{ github.event.inputs.to_date }}"
           delay = "${{ github.event.inputs.delay_seconds }}"
 
-          # --list でスナップショット一覧を取得
+          # ① --list でスナップショット一覧を取得（出力はURL形式）
           cmd_list = ["waybackpack", url, "--list"]
           if from_date: cmd_list += ["--from-date", from_date]
           if to_date: cmd_list += ["--to-date", to_date]
@@ -68,23 +68,37 @@ jobs:
               print("Failed to list snapshots:", result.stderr, file=sys.stderr)
               sys.exit(1)
 
-          timestamps = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-          print(f"Found {len(timestamps)} snapshots total.")
+          # ② 各行から14桁のタイムスタンプだけを抽出（URLから分離）
+          timestamps = []
+          for line in result.stdout.splitlines():
+              line = line.strip()
+              if not line: continue
+              # URL中の /web/<timestamp>/ 部分を抽出
+              m = re.search(r'/web/(\d{14})/', line)
+              if m:
+                  timestamps.append(m.group(1))
+
+          print(f"Found {len(timestamps)} valid snapshots (after timestamp extraction).")
+          if not timestamps:
+              print("No valid timestamps found. Check the URL or date filters.", file=sys.stderr)
+              sys.exit(1)
 
           selected = timestamps[:max_n]
           print(f"Downloading first {len(selected)} snapshots (max_snapshots={max_n}).")
 
-          if not selected:
-              print("No snapshots to download.", file=sys.stderr)
-              sys.exit(1)
-
-          # 選択したタイムスタンプごとに waybackpack を実行
+          # ③ 抽出したタイムスタンプを日付範囲に指定してダウンロード
           outdir = "downloaded-archive"
           os.makedirs(outdir, exist_ok=True)
 
           for ts in selected:
               print(f"Downloading snapshot: {ts}")
-              cmd_dl = ["waybackpack", url, "-d", outdir, "--from-date", ts, "--to-date", ts, "--delay", delay, "--ignore-errors", "--max-retries", "3"]
+              cmd_dl = [
+                  "waybackpack", url,
+                  "-d", outdir,
+                  "--from-date", ts, "--to-date", ts,
+                  "--delay", delay,
+                  "--ignore-errors", "--max-retries", "3"
+              ]
               subprocess.run(cmd_dl, check=False)
 
           print(f"Done. Files saved under {outdir}/")
